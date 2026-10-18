@@ -1,0 +1,1 @@
+ALTER TABLE "daystar_v2_workspaces" ADD COLUMN "coach_last_at" timestamp;
