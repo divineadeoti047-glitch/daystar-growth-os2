@@ -2,11 +2,26 @@
   "name": "DAYSTAR Personal Growth OS",
   "short_name": "DAYSTAR",
   "description": "A little progress. A day at a time.",
+  "id": "/",
+  "scope": "/",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#172A46",
+  "background_color": "#F7F5EF",
   "theme_color": "#172A46",
+  "categories": ["lifestyle", "productivity"],
   "icons": [
+    {
+      "src": "/daystar-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/daystar-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
     {
       "src": "/daystar.svg",
       "sizes": "any",

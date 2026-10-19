@@ -14,6 +14,12 @@ export const Route = createRootRoute({
   head: () => ({
     links: [
       { rel: 'icon', href: '/daystar.svg', type: 'image/svg+xml' },
+      {
+        rel: 'icon',
+        href: '/daystar-192.png',
+        sizes: '192x192',
+        type: 'image/png',
+      },
       { rel: 'manifest', href: '/manifest.webmanifest' },
     ],
     meta: [
@@ -23,7 +29,7 @@ export const Route = createRootRoute({
       },
       {
         name: 'viewport',
-        content: 'width=device-width, initial-scale=1',
+        content: 'width=device-width, initial-scale=1, viewport-fit=cover',
       },
       {
         title: siteName,

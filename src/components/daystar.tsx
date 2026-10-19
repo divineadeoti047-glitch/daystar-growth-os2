@@ -62,6 +62,20 @@ import { Learning } from './learning'
 import { GrowthStudio, DailyBrief } from './growth-studio'
 import { CommandMenu } from './command-menu'
 import { enableNotifications, deliverNotification } from '@/lib/notifications'
+import { registerAppShellServiceWorker } from '@/lib/app-shell'
+import {
+  accountScope,
+  applyOfflineOperations,
+  clearOfflineData,
+  listOfflineOperations,
+  queueOfflineOperation,
+  readDeviceScope,
+  readOfflineSnapshot,
+  rebaseOfflineOperation,
+  removeOfflineOperations,
+  saveOfflineSnapshot,
+} from '@/lib/offline'
+import type { OfflineConflict, OfflineOperation } from '@/lib/offline'
 import {
   formatPercent,
   dueReminders,
@@ -98,6 +112,11 @@ type Modal = {
   type: 'task' | 'journal' | 'goal' | 'progress' | 'auth' | 'area'
   id?: string
 }
+type IdentitySession =
+  | { kind: 'unknown' }
+  | { kind: 'device' }
+  | { kind: 'account'; userId: string }
+type SyncState = 'idle' | 'offline' | 'pending' | 'syncing' | 'conflict' | 'error'
 const mainNav = [
   { name: 'Home', icon: Home },
   { name: 'Tasks', icon: CheckSquare },
@@ -180,7 +199,9 @@ export default function Daystar() {
     [saving, setSaving] = useState(false),
     [error, setError] = useState(''),
     [mode, setMode] = useState('device'),
-    [user, setUser] = useState<{ email?: string; name?: string } | null>(null),
+    [user, setUser] = useState<
+      { id?: string; email?: string; name?: string } | null
+    >(null),
     [google, setGoogle] = useState(false),
     [search, setSearch] = useState(''),
     [area, setArea] = useState('all'),
@@ -191,15 +212,25 @@ export default function Daystar() {
     [authMode, setAuthMode] = useState('login'),
     [authPending, setAuthPending] = useState(false),
     [menu, setMenu] = useState(false),
-    [permission, setPermission] = useState('not requested')
+    [permission, setPermission] = useState('not requested'),
+    [online, setOnline] = useState(
+      typeof navigator === 'undefined' ? true : navigator.onLine,
+    ),
+    [syncState, setSyncState] = useState<SyncState>('idle'),
+    [pendingCount, setPendingCount] = useState(0),
+    [offlineConflicts, setOfflineConflicts] = useState<OfflineConflict[]>([]),
+    [offlineAvailable, setOfflineAvailable] = useState(true)
   const commandOpen = useRef(false)
+  const pendingCountRef = useRef(0)
   const scope = useRef(''),
+    identity = useRef<IdentitySession>({ kind: 'unknown' }),
     authBusy = useRef(false),
     modalState = useRef(modal),
     learningEditing = useRef(false),
     reminderAttempt = useRef(''),
     revision = useRef(0),
     busy = useRef(false),
+    syncBusy = useRef(false),
     latest = useRef(w),
     file = useRef<HTMLInputElement>(null),
     focusFinishing = useRef(false)
@@ -209,6 +240,82 @@ export default function Daystar() {
   useEffect(() => {
     modalState.current = modal
   }, [modal])
+  function setPendingTotal(count: number) {
+    pendingCountRef.current = count
+    setPendingCount(count)
+  }
+  async function pendingFor(scopeValue = scope.current) {
+    if (!scopeValue) return []
+    try {
+      return await listOfflineOperations(scopeValue)
+    } catch {
+      setOfflineAvailable(false)
+      return []
+    }
+  }
+  async function refreshPendingCount(scopeValue = scope.current) {
+    const operations = await pendingFor(scopeValue)
+    setPendingTotal(operations.length)
+    return operations
+  }
+  async function cacheWorkspace(
+    workspace: Workspace,
+    scopeValue = scope.current,
+    revisionValue = revision.current,
+    modeValue: 'account' | 'device' =
+      mode === 'account' ? 'account' : 'device',
+  ) {
+    if (!scopeValue) return
+    try {
+      await saveOfflineSnapshot({
+        scope: scopeValue,
+        revision: revisionValue,
+        mode: modeValue,
+        workspace,
+        savedAt: new Date().toISOString(),
+      })
+    } catch {
+      setOfflineAvailable(false)
+    }
+  }
+  async function restoreOfflineWorkspace() {
+    try {
+      const session = identity.current
+      const expectedScope =
+        session.kind === 'account'
+          ? await accountScope(session.userId)
+          : session.kind === 'device'
+            ? await readDeviceScope()
+            : undefined
+      if (!expectedScope) return false
+      const cached = await readOfflineSnapshot(expectedScope)
+      if (!cached) return false
+      if (
+        (session.kind === 'account' && cached.mode !== 'account') ||
+        (session.kind === 'device' && cached.mode !== 'device')
+      )
+        return false
+      const operations = await listOfflineOperations(expectedScope)
+      const replayed = applyOfflineOperations(cached.workspace, operations)
+      const d = dateKey(replayed.workspace.preferences.timezone)
+      scope.current = cached.scope
+      revision.current = cached.revision
+      latest.current = replayed.workspace
+      setW(replayed.workspace)
+      setMode(cached.mode)
+      setToday(d)
+      setDate(d)
+      setPendingTotal(operations.length)
+      setOfflineConflicts(replayed.conflicts)
+      setOnline(false)
+      setSyncState(replayed.conflicts.length ? 'conflict' : 'offline')
+      setLoaded(true)
+      return true
+    } catch {
+      setOfflineAvailable(false)
+      return false
+    }
+  }
   async function load() {
     setError('')
     setLoaded(false)
@@ -219,18 +326,54 @@ export default function Daystar() {
       )
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Unable to load workspace')
+      if (
+        identity.current.kind === 'account' &&
+        (await accountScope(identity.current.userId)) !== data.scope
+      ) {
+        scope.current = ''
+        revision.current = 0
+        latest.current = initialWorkspace()
+        setW(initialWorkspace())
+        setPendingTotal(0)
+        setOfflineConflicts([])
+        setSyncState('error')
+        throw new Error(
+          'The signed-in account changed while this workspace was loading. Reload after confirming the correct account.',
+        )
+      }
       const valid = workspaceSchema.parse(data.data)
+      const workspaceScope = String(data.scope || '')
+      const workspaceMode = data.mode === 'account' ? 'account' : 'device'
+      if (!/^[a-f0-9]{64}$/.test(workspaceScope))
+        throw new Error('The workspace did not return a valid privacy scope.')
+      if (identity.current.kind === 'unknown')
+        identity.current =
+          workspaceMode === 'account'
+            ? { kind: 'unknown' }
+            : { kind: 'device' }
       latest.current = valid
       setW(valid)
       revision.current = data.revision
-      scope.current = data.scope
-      setMode(data.mode)
+      scope.current = workspaceScope
+      setMode(workspaceMode)
       const d = dateKey(valid.preferences.timezone)
       setToday(d)
       setDate(d)
+      setOnline(true)
+      setOfflineConflicts([])
       setLoaded(true)
+      await cacheWorkspace(valid, workspaceScope, data.revision, workspaceMode)
+      const operations = await refreshPendingCount(workspaceScope)
+      setSyncState(operations.length ? 'pending' : 'idle')
+      if (operations.length) void syncPending()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to load workspace')
+      const message = e instanceof Error ? e.message : 'Unable to load workspace'
+      if (!message.startsWith('The signed-in account changed')) {
+        const restored = await restoreOfflineWorkspace()
+        if (restored) return
+        setSyncState(navigator.onLine ? 'error' : 'offline')
+      }
+      setError(message)
     }
   }
   useEffect(() => {
@@ -242,7 +385,10 @@ export default function Daystar() {
           setModal({ type: 'auth' })
         }
         const u = await getUser()
-        setUser(u ? { email: u.email, name: u.name } : null)
+        identity.current = u?.id
+          ? { kind: 'account', userId: u.id }
+          : { kind: 'device' }
+        setUser(u ? { id: u.id, email: u.email, name: u.name } : null)
         const settings = await getSettings()
         setGoogle(!!settings.providers.google)
       } catch {
@@ -252,8 +398,28 @@ export default function Daystar() {
     }
     void init()
     const timer = setInterval(() => setTick(Date.now()), 1000)
+    const onOnline = () => {
+      setOnline(true)
+      void refreshPendingCount().then((operations) => {
+        if (operations.length) {
+          setSyncState('pending')
+          void syncPending()
+        } else setSyncState('idle')
+      })
+    }
+    const onOffline = () => {
+      setOnline(false)
+      setSyncState('offline')
+    }
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
+    void registerAppShellServiceWorker().catch(() => setOfflineAvailable(false))
     if ('Notification' in window) setPermission(Notification.permission)
-    return () => clearInterval(timer)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
+    }
   }, [])
   useEffect(() => {
     const d = dateKey(w.preferences.timezone, new Date(tick))
@@ -262,7 +428,61 @@ export default function Daystar() {
       if (date === today) setDate(d)
     }
   }, [tick, w.preferences.timezone, today, date])
-  async function save(next: Workspace) {
+  useEffect(() => {
+    if (
+      (!online || syncState === 'offline') &&
+      !['Home', 'Tasks', 'Insights'].includes(page)
+    )
+      setPage('Home')
+  }, [online, syncState, page])
+  async function saveOffline(
+    valid: Workspace,
+    operation: OfflineOperation | undefined,
+  ) {
+    if (!operation || !scope.current) {
+      setError(
+        'This action needs a live connection; only task edits and daily progress can be saved offline.',
+      )
+      toast.error('Connect to save this change.')
+      return false
+    }
+    try {
+      await queueOfflineOperation(
+        {
+          scope: scope.current,
+          revision: revision.current,
+          mode: mode === 'account' ? 'account' : 'device',
+          workspace: valid,
+          savedAt: new Date().toISOString(),
+        },
+        operation,
+      )
+      latest.current = valid
+      setW(valid)
+      setError('')
+      const operations = await refreshPendingCount(scope.current)
+      setSyncState('offline')
+      toast.success(
+        operations.length === 1
+          ? 'Saved on this device. It will sync when you reconnect.'
+          : 'Saved on this device. Changes will sync when you reconnect.',
+      )
+      return true
+    } catch (e) {
+      setOfflineAvailable(false)
+      setError(
+        e instanceof Error
+          ? `This change could not be stored offline: ${e.message}`
+          : 'This change could not be stored offline.',
+      )
+      toast.error('Offline storage failed; the change was not saved.')
+      return false
+    }
+  }
+  async function save(
+    next: Workspace,
+    offlineOperation?: OfflineOperation,
+  ) {
     if (busy.current) {
       toast('A save is already in progress. Please try again in a moment.')
       return false
@@ -272,6 +492,22 @@ export default function Daystar() {
     setError('')
     try {
       const valid = workspaceSchema.parse(next)
+      if (!navigator.onLine || syncState === 'offline')
+        return await saveOffline(valid, offlineOperation)
+      const outstanding = await pendingFor()
+      if (outstanding.length) {
+        setPendingTotal(outstanding.length)
+        if (!syncBusy.current) await syncPending()
+        if ((await pendingFor()).length) {
+          setError(
+            'Resolve the waiting offline changes before saving anything else.',
+          )
+          toast.error('Your existing offline changes need to sync first.')
+          return false
+        }
+        toast('Your offline changes synced. Review the refreshed form, then save again.')
+        return false
+      }
       const res = await fetch('/.netlify/functions/workspace', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -286,8 +522,26 @@ export default function Daystar() {
       revision.current = result.revision
       setW(valid)
       latest.current = valid
+      await cacheWorkspace(valid)
+      await refreshPendingCount()
+      setSyncState('idle')
+      setOnline(true)
       return true
     } catch (e) {
+      if (
+        offlineOperation &&
+        (e instanceof TypeError || !navigator.onLine)
+      ) {
+        setOnline(false)
+        return await saveOffline(
+          workspaceSchema.parse(next),
+          offlineOperation,
+        )
+      }
+      if (!navigator.onLine) {
+        setOnline(false)
+        setSyncState('offline')
+      } else setSyncState('error')
       setError(e instanceof Error ? e.message : 'Saving failed')
       toast.error(
         'Changes are not saved. Your form stays open so you can retry.',
@@ -298,10 +552,151 @@ export default function Daystar() {
       busy.current = false
     }
   }
+  async function syncPending() {
+    if (syncBusy.current || !scope.current || !navigator.onLine) return
+    const expectedScope = scope.current
+    const operations = await pendingFor(expectedScope)
+    setPendingTotal(operations.length)
+    if (!operations.length) return
+    syncBusy.current = true
+    setSyncState('syncing')
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await fetch(
+          '/.netlify/functions/workspace?timezone=' +
+            encodeURIComponent(
+              Intl.DateTimeFormat().resolvedOptions().timeZone,
+            ),
+        )
+        const data = await response.json()
+        if (!response.ok)
+          throw new Error(
+            response.status === 401
+              ? 'Sign in again to sync changes saved for this account.'
+              : data.error || 'Could not check the latest workspace.',
+          )
+        if (data.scope !== expectedScope) {
+          const empty = initialWorkspace()
+          scope.current = ''
+          revision.current = 0
+          latest.current = empty
+          setW(empty)
+          setLoaded(false)
+          setPendingTotal(0)
+          setOfflineConflicts([])
+          throw new Error(
+            'The active account or device workspace changed. Offline changes remain private and were not sent.',
+          )
+        }
+        const remote = workspaceSchema.parse(data.data)
+        const result = applyOfflineOperations(remote, operations)
+        let nextRevision = data.revision as number
+        if (result.writeRequired) {
+          const write = await fetch('/.netlify/functions/workspace', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              data: result.workspace,
+              revision: data.revision,
+              scope: expectedScope,
+            }),
+          })
+          const body = await write.json()
+          if (write.status === 409) continue
+          if (!write.ok)
+            throw new Error(body.error || 'Sync was rejected by the server.')
+          nextRevision = body.revision
+        }
+        await removeOfflineOperations(expectedScope, result.appliedIds)
+        revision.current = nextRevision
+        const remaining = await refreshPendingCount(expectedScope)
+        setMode(data.mode === 'account' ? 'account' : 'device')
+        setOnline(true)
+        setOfflineConflicts(result.conflicts)
+        if (result.conflicts.length) {
+          setSyncState('conflict')
+          await cacheWorkspace(
+            latest.current,
+            expectedScope,
+            nextRevision,
+            data.mode === 'account' ? 'account' : 'device',
+          )
+          return
+        }
+        latest.current = result.workspace
+        setW(result.workspace)
+        await cacheWorkspace(
+          result.workspace,
+          expectedScope,
+          nextRevision,
+          data.mode === 'account' ? 'account' : 'device',
+        )
+        setSyncState(remaining.length ? 'pending' : 'idle')
+        return
+      }
+      setSyncState('error')
+      setError(
+        'Your workspace changed repeatedly while syncing. Your offline edits are still saved; retry when the workspace is quiet.',
+      )
+    } catch (e) {
+      if (!navigator.onLine) {
+        setOnline(false)
+        setSyncState('offline')
+      } else setSyncState('error')
+      setError(e instanceof Error ? e.message : 'Sync failed.')
+    } finally {
+      syncBusy.current = false
+    }
+  }
+  async function resolveOfflineConflict(
+    conflict: OfflineConflict,
+    keepLocal: boolean,
+  ) {
+    if (!online || !navigator.onLine || syncState === 'syncing') return
+    if (keepLocal) {
+      if (
+        conflict.kind === 'progress-entry' ||
+        conflict.kind === 'progress-remove' ||
+        (conflict.kind === 'occurrence-status' && !conflict.currentStatus)
+      )
+        return
+      await rebaseOfflineOperation(scope.current, conflict)
+      setOfflineConflicts((items) =>
+        items.filter((item) => item.operationId !== conflict.operationId),
+      )
+      setSyncState('pending')
+      void syncPending()
+      return
+    }
+    const detail =
+      conflict.kind === 'progress-entry' || conflict.kind === 'progress-remove'
+        ? 'The pending progress change'
+        : 'The offline edit'
+    if (
+      !confirm(
+        `${detail} will be removed from this device and the latest server version will be kept. This cannot be undone. Continue?`,
+      )
+    )
+      return
+    await removeOfflineOperations(scope.current, [conflict.operationId])
+    const remaining = await refreshPendingCount()
+    const unresolved = offlineConflicts.filter(
+      (item) => item.operationId !== conflict.operationId,
+    )
+    setOfflineConflicts(unresolved)
+    if (remaining.length) {
+      setSyncState('pending')
+      void syncPending()
+    } else {
+      setSyncState('idle')
+      await load()
+    }
+  }
   useEffect(() => {
     const interval = setInterval(async () => {
       if (
         !loaded ||
+        !navigator.onLine ||
         modal ||
         learningEditing.current ||
         commandOpen.current ||
@@ -312,6 +707,10 @@ export default function Daystar() {
         )
       )
         return
+      if (pendingCountRef.current > 0) {
+        void syncPending()
+        return
+      }
       try {
         const priorRevision = revision.current
         const priorScope = scope.current
@@ -329,18 +728,36 @@ export default function Daystar() {
           learningEditing.current ||
           commandOpen.current ||
           revision.current !== priorRevision ||
-          scope.current !== priorScope ||
-          data.scope !== scope.current
+          scope.current !== priorScope
         )
           return
+        if (data.scope !== scope.current) {
+          const empty = initialWorkspace()
+          scope.current = ''
+          revision.current = 0
+          latest.current = empty
+          setW(empty)
+          setLoaded(false)
+          setPendingTotal(0)
+          setOfflineConflicts([])
+          setSyncState('error')
+          setError(
+            'The active account or device workspace changed. Reload before continuing.',
+          )
+          return
+        }
         if (data.revision !== revision.current) {
           const next = workspaceSchema.parse(data.data)
           setW(next)
           latest.current = next
           revision.current = data.revision
+          await cacheWorkspace(next, scope.current, data.revision)
         }
       } catch {
-        /* The next save reports connection failures. */
+        if (!navigator.onLine) {
+          setOnline(false)
+          setSyncState('offline')
+        }
       }
     }, 30000)
     return () => clearInterval(interval)
@@ -459,10 +876,32 @@ export default function Daystar() {
     })
   }, [tick, loaded, w.reminders, today])
   function navigate(p: Page) {
+    if (
+      (!online || syncState === 'offline') &&
+      !['Home', 'Tasks', 'Insights'].includes(p)
+    ) {
+      toast('Journal, coaching, reviews and settings need a connection.')
+      return
+    }
     learningEditing.current = false
     setPage(p)
     setMenu(false)
     setSearch('')
+  }
+  function occurrenceStatusOperation(
+    occurrence: Occurrence,
+    status: Occurrence['status'],
+  ): OfflineOperation {
+    return {
+      id: uid(),
+      scope: scope.current,
+      createdAt: new Date().toISOString(),
+      kind: 'occurrence-status',
+      occurrenceId: occurrence.id,
+      baseOccurrence: occurrence,
+      baseStatus: occurrence.status,
+      status,
+    }
   }
   async function complete(o: Occurrence) {
     if (o.date > today) {
@@ -473,8 +912,10 @@ export default function Daystar() {
       setModal({ type: 'progress', id: o.id })
       return
     }
+    const status = isComplete(o) ? 'open' : 'completed'
     await save(
-      putOccurrence(w, { ...o, status: isComplete(o) ? 'open' : 'completed' }),
+      putOccurrence(w, { ...o, status }),
+      occurrenceStatusOperation(o, status),
     )
   }
   async function archive(t: Task) {
@@ -511,10 +952,20 @@ export default function Daystar() {
       v = (key: string) => String(f.get(key) || '')
     const now = new Date().toISOString()
     let next = w
+    let offlineOperation: OfflineOperation | undefined
     try {
       if (modal.type === 'auth') {
         authBusy.current = true
         setAuthPending(true)
+        if (authMode === 'login' || authMode === 'signup') {
+          const waiting = await pendingFor()
+          if (waiting.length) {
+            toast.error(
+              'Sync or resolve this workspace’s offline changes before switching accounts.',
+            )
+            return
+          }
+        }
         if (authMode === 'newpassword') {
           await updateUser({ password: v('password') })
           toast.success('Password updated.')
@@ -534,7 +985,8 @@ export default function Daystar() {
           toast.success('Check your email to confirm your account.')
           return
         }
-        setUser({ email: u.email, name: u.name })
+        identity.current = { kind: 'account', userId: u.id }
+        setUser({ id: u.id, email: u.email, name: u.name })
         setModal(null)
         await load()
         return
@@ -560,6 +1012,15 @@ export default function Daystar() {
           createdAt: existing?.createdAt ?? now,
           updatedAt: now,
         }
+        offlineOperation = {
+          id: uid(),
+          scope: scope.current,
+          createdAt: now,
+          kind: 'task-save',
+          date: today,
+          task,
+          baseTask: existing ?? null,
+        }
         if (task.date < addDay(today, -3650) || task.date > addDay(today, 3650))
           throw new Error('Choose a start date within ten years of today.')
         if (task.end && task.end < task.date)
@@ -579,10 +1040,20 @@ export default function Daystar() {
         const value = Number(v('value'))
         if (!Number.isFinite(value) || value <= 0)
           throw new Error('Enter a positive progress amount.')
+        const entry = { id: uid(), value, at: now }
+        offlineOperation = {
+          id: uid(),
+          scope: scope.current,
+          createdAt: now,
+          kind: 'progress-entry',
+          occurrenceId: o.id,
+          baseOccurrence: o,
+          entry,
+        }
         next = putOccurrence(w, {
           ...o,
           status: 'open',
-          entries: [...o.entries, { id: uid(), value, at: now }],
+          entries: [...o.entries, entry],
         })
       }
       if (modal.type === 'journal') {
@@ -645,7 +1116,7 @@ export default function Daystar() {
             : [...w.areas, item],
         }
       }
-      if (await save(next)) {
+      if (await save(next, offlineOperation)) {
         setModal(null)
         toast.success('Saved to your workspace.')
       }
@@ -826,12 +1297,14 @@ export default function Daystar() {
                       `${o.status === 'skipped' ? 'Restore' : 'Skip'} this occurrence? Skipped occurrences are excluded from your metrics.`,
                     )
                   )
-                    await save(
-                      putOccurrence(w, {
-                        ...o,
-                        status: o.status === 'skipped' ? 'open' : 'skipped',
-                      }),
-                    )
+                    {
+                      const status =
+                        o.status === 'skipped' ? 'open' : 'skipped'
+                      await save(
+                        putOccurrence(w, { ...o, status }),
+                        occurrenceStatusOperation(o, status),
+                      )
+                    }
                 }}
                 className={`task-badge ${done ? 'success' : o.status === 'skipped' ? 'muted' : o.date < today ? 'late' : ''}`}
               >
@@ -909,6 +1382,31 @@ export default function Daystar() {
       (area === 'all' || o.snapshot.area === area) &&
       o.snapshot.title.toLowerCase().includes(search.toLowerCase()),
   )
+  const offlineMode = !online || syncState === 'offline'
+  const statusLabel =
+    saving || authPending
+      ? 'Saving…'
+      : syncState === 'syncing'
+        ? 'Syncing…'
+        : pendingCount > 0
+          ? `${pendingCount} pending`
+          : offlineMode
+            ? 'Offline'
+            : syncState === 'error'
+              ? 'Sync paused'
+              : loaded
+                ? user
+                  ? 'Synced to account'
+                  : 'Saved privately'
+                : 'Connecting…'
+  const statusClass =
+    error || syncState === 'error'
+      ? 'status-error'
+      : offlineMode
+        ? 'status-offline'
+        : pendingCount
+          ? 'status-pending'
+          : ''
   const areaSelect = (value?: string) => (
     <select name="area" defaultValue={value ?? w.areas[0]?.id}>
       {w.areas.map((a) => (
@@ -950,6 +1448,14 @@ export default function Daystar() {
             <button
               key={n.name}
               className={page === n.name ? 'active' : ''}
+              disabled={
+                offlineMode && !['Home', 'Tasks', 'Insights'].includes(n.name)
+              }
+              title={
+                offlineMode && !['Home', 'Tasks', 'Insights'].includes(n.name)
+                  ? 'Available when you reconnect'
+                  : undefined
+              }
               aria-current={page === n.name ? 'page' : undefined}
               onClick={() => navigate(n.name)}
             >
@@ -968,6 +1474,8 @@ export default function Daystar() {
             <button
               key={n.name}
               className={page === n.name ? 'active' : ''}
+              disabled={offlineMode}
+              title={offlineMode ? 'Available when you reconnect' : undefined}
               aria-current={page === n.name ? 'page' : undefined}
               onClick={() => navigate(n.name)}
             >
@@ -990,6 +1498,8 @@ export default function Daystar() {
           </div>
           <button
             className={`settings-nav ${page === 'Settings' ? 'active' : ''}`}
+            disabled={offlineMode}
+            title={offlineMode ? 'Available when you reconnect' : undefined}
             onClick={() => navigate('Settings')}
           >
             <Settings size={19} />
@@ -998,7 +1508,9 @@ export default function Daystar() {
           <button
             className="profile"
             onClick={() => {
-              user ? navigate('Settings') : setModal({ type: 'auth' })
+              if (user) navigate('Settings')
+              else if (offlineMode) toast('Sign-in requires a connection.')
+              else setModal({ type: 'auth' })
             }}
           >
             <span className="avatar">
@@ -1040,15 +1552,9 @@ export default function Daystar() {
               />
             )}
 
-            <span className="save-status">
-              <span className={error ? 'status-error' : ''} />
-              {saving || authPending
-                ? 'Saving…'
-                : loaded
-                  ? user
-                    ? 'Cloud saved'
-                    : 'Private workspace'
-                  : 'Connecting…'}
+            <span className="save-status" aria-live="polite">
+              <span className={statusClass} />
+              {statusLabel}
             </span>
             <button
               className="icon-btn notification-btn"
@@ -1068,6 +1574,102 @@ export default function Daystar() {
           </div>
         </header>
         <main id="workspace-content" tabIndex={-1}>
+          {loaded &&
+            (offlineMode ||
+              pendingCount > 0 ||
+              offlineConflicts.length > 0 ||
+              syncState === 'error') && (
+              <section
+                className={`offline-banner ${offlineConflicts.length ? 'has-conflicts' : ''}`}
+                role={
+                  offlineConflicts.length || syncState === 'error'
+                    ? 'alert'
+                    : 'status'
+                }
+                aria-live="polite"
+              >
+                <div className="offline-banner-copy">
+                  <strong>
+                    {offlineConflicts.length
+                      ? `${offlineConflicts.length} change${offlineConflicts.length === 1 ? '' : 's'} need your review`
+                      : syncState === 'error'
+                        ? 'Sync is paused'
+                        : offlineMode
+                          ? 'Working offline'
+                          : `${pendingCount} change${pendingCount === 1 ? '' : 's'} waiting to sync`}
+                  </strong>
+                  <p>
+                    {offlineConflicts.length
+                      ? 'Nothing was overwritten. Your local edits are still stored on this device.'
+                      : syncState === 'error'
+                        ? error ||
+                          'Your pending changes remain saved on this device.'
+                        : 'Tasks and daily progress work offline. Journaling, coaching, reviews and account settings need a connection.'}
+                    {pendingCount > 0 && !offlineConflicts.length
+                      ? ` ${pendingCount} local change${pendingCount === 1 ? '' : 's'} will sync safely when the workspace is reachable.`
+                      : ''}
+                  </p>
+                </div>
+                {pendingCount > 0 && (
+                  <button
+                    className="button secondary sync-now"
+                    disabled={syncState === 'syncing'}
+                    onClick={() => {
+                      if (!navigator.onLine) {
+                        toast('Your device is still offline.')
+                        return
+                      }
+                      setOnline(true)
+                      void syncPending()
+                    }}
+                  >
+                    {syncState === 'syncing' ? 'Syncing…' : 'Sync now'}
+                  </button>
+                )}
+                {!!offlineConflicts.length && (
+                  <div className="offline-conflicts">
+                    {offlineConflicts.map((conflict) => {
+                      const canKeepLocal =
+                        ['task-save', 'occurrence-status'].includes(
+                          conflict.kind,
+                        ) &&
+                        (conflict.kind !== 'occurrence-status' ||
+                          !!conflict.currentStatus)
+                      return (
+                        <article
+                          className="offline-conflict"
+                          key={conflict.operationId}
+                        >
+                          <p>{conflict.summary}</p>
+                          <div className="offline-conflict-actions">
+                            {canKeepLocal && (
+                              <button
+                                className="button primary"
+                                disabled={syncState === 'syncing'}
+                                onClick={() =>
+                                  void resolveOfflineConflict(conflict, true)
+                                }
+                              >
+                                Keep my local edit
+                              </button>
+                            )}
+                            <button
+                              className="button secondary"
+                              disabled={syncState === 'syncing'}
+                              onClick={() =>
+                                void resolveOfflineConflict(conflict, false)
+                              }
+                            >
+                              Keep server version
+                            </button>
+                          </div>
+                        </article>
+                      )
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
           {error && !modal && (
             <div className="error-banner" role="alert">
               <span>{error}</span>
@@ -2586,9 +3188,31 @@ export default function Daystar() {
                 {user ? (
                   <button
                     className="button secondary"
+                    disabled={!online || pendingCount > 0}
                     onClick={async () => {
+                      if (pendingCount > 0) {
+                        toast.error(
+                          'Sync or resolve offline changes before signing out.',
+                        )
+                        return
+                      }
+                      if (!online) {
+                        toast.error('Reconnect before signing out.')
+                        return
+                      }
+                      const accountWorkspaceScope = scope.current
                       await logout()
+                      if (accountWorkspaceScope) {
+                        try {
+                          await clearOfflineData(accountWorkspaceScope)
+                          setOfflineAvailable(true)
+                        } catch {
+                          setOfflineAvailable(false)
+                        }
+                      }
+                      identity.current = { kind: 'device' }
                       setUser(null)
+                      setOfflineConflicts([])
                       await load()
                       toast('Signed out. Your account records stay private.')
                     }}
@@ -2616,6 +3240,38 @@ export default function Daystar() {
                     </button>
                   </>
                 )}
+                <div className="offline-privacy">
+                  <strong>Offline copy · {offlineAvailable ? 'available' : 'unavailable'}</strong>
+                  <p>
+                    Only tasks and daily progress are cached in this browser,
+                    separately for each account. Journals, coaching, settings
+                    and other records stay online. Pending edits remain here
+                    until synced or explicitly discarded.
+                  </p>
+                  <button
+                    className="text-link"
+                    disabled={!scope.current || pendingCount > 0}
+                    onClick={async () => {
+                      if (
+                        pendingCount > 0 ||
+                        !confirm(
+                          'Remove this workspace’s offline task copy from this device? Server records will not be changed.',
+                        )
+                      )
+                        return
+                      try {
+                        await clearOfflineData(scope.current)
+                        setOfflineAvailable(true)
+                        toast.success('Offline copy cleared from this device.')
+                      } catch {
+                        setOfflineAvailable(false)
+                        toast.error('The offline copy could not be cleared.')
+                      }
+                    }}
+                  >
+                    Clear offline copy from this device
+                  </button>
+                </div>
                 <form
                   className="settings-form"
                   onSubmit={async (e) => {
@@ -2900,6 +3556,14 @@ export default function Daystar() {
           <button
             key={n.name}
             className={page === n.name ? 'active' : ''}
+            disabled={
+              offlineMode && !['Home', 'Tasks', 'Insights'].includes(n.name)
+            }
+            title={
+              offlineMode && !['Home', 'Tasks', 'Insights'].includes(n.name)
+                ? 'Available when you reconnect'
+                : undefined
+            }
             aria-current={page === n.name ? 'page' : undefined}
             onClick={() => navigate(n.name as Page)}
           >
@@ -3137,6 +3801,15 @@ export default function Daystar() {
                                 (x) => x.id !== e.id,
                               ),
                             }),
+                            {
+                              id: uid(),
+                              scope: scope.current,
+                              createdAt: new Date().toISOString(),
+                              kind: 'progress-remove',
+                              occurrenceId: editOcc.id,
+                              baseOccurrence: editOcc,
+                              entryId: e.id,
+                            },
                           )
                       }}
                     >
@@ -3154,13 +3827,12 @@ export default function Daystar() {
                         `${editOcc.status === 'skipped' ? 'Restore' : 'Skip'} this occurrence? Skipped occurrences are excluded from metrics; progress stays recorded.`,
                       )
                     ) {
+                      const status =
+                        editOcc.status === 'skipped' ? 'open' : 'skipped'
                       if (
                         await save(
-                          putOccurrence(w, {
-                            ...editOcc,
-                            status:
-                              editOcc.status === 'skipped' ? 'open' : 'skipped',
-                          }),
+                          putOccurrence(w, { ...editOcc, status }),
+                          occurrenceStatusOperation(editOcc, status),
                         )
                       )
                         setModal(null)
