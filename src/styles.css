@@ -1877,6 +1877,31 @@ h2 {
   white-space: nowrap;
   font-size: 12px;
 }
+.sync-conflict {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 24px;
+  padding: 18px;
+  border: 1px solid #b08d5790;
+  border-radius: 8px;
+  background: #fffaf0;
+  color: #26364a;
+  font-size: 12px;
+}
+.sync-conflict p {
+  margin: 5px 0 0;
+  color: #626a73;
+  line-height: 1.6;
+}
+.sync-conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.sync-conflict-actions .button {
+  min-height: 40px;
+  white-space: normal;
+}
 .daystar-dialog {
   background: #f7f3ea !important;
   border-color: #b08d5766 !important;

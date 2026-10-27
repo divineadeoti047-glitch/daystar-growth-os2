@@ -63,6 +63,12 @@ import { GrowthStudio, DailyBrief } from './growth-studio'
 import { CommandMenu } from './command-menu'
 import { enableNotifications, deliverNotification } from '@/lib/notifications'
 import {
+  readSnapshot,
+  syncDecision,
+  writeSnapshot,
+} from '@/lib/offline-workspace'
+import type { OfflineSnapshot } from '@/lib/offline-workspace'
+import {
   formatPercent,
   dueReminders,
   overdueOccurrences,
@@ -114,6 +120,21 @@ const extraNav = [
 const areaIcons = [Leaf, GraduationCap, BriefcaseBusiness, Heart, Sprout]
 const uid = () => crypto.randomUUID()
 const pc = formatPercent
+function savedRecordCount(w: Workspace) {
+  return (
+    w.courses.length +
+    w.projects.length +
+    w.spiritualPlans.length +
+    w.weeklyReviews.length +
+    w.reminders.length +
+    w.learning.length +
+    w.tasks.length +
+    w.occurrences.length +
+    w.journals.length +
+    w.goals.length +
+    w.focus.length
+  )
+}
 const nice = (
   d: string,
   opts: Intl.DateTimeFormatOptions = { month: 'long', day: 'numeric' },
@@ -178,6 +199,16 @@ export default function Daystar() {
     [date, setDate] = useState(dateKey()),
     [loaded, setLoaded] = useState(false),
     [saving, setSaving] = useState(false),
+    [offlinePending, setOfflinePending] = useState(false),
+    [offlineStorageAvailable, setOfflineStorageAvailable] = useState<
+      boolean | null
+    >(null),
+    [offlineConflict, setOfflineConflict] = useState<{
+      local: OfflineSnapshot
+      cloud: Workspace
+      revision: number
+      scope: string
+    } | null>(null),
     [error, setError] = useState(''),
     [mode, setMode] = useState('device'),
     [user, setUser] = useState<{ email?: string; name?: string } | null>(null),
@@ -194,6 +225,7 @@ export default function Daystar() {
     [permission, setPermission] = useState('not requested')
   const commandOpen = useRef(false)
   const scope = useRef(''),
+    loadRef = useRef<() => Promise<void>>(async () => {}),
     authBusy = useRef(false),
     modalState = useRef(modal),
     learningEditing = useRef(false),
@@ -212,6 +244,12 @@ export default function Daystar() {
   async function load() {
     setError('')
     setLoaded(false)
+    let offlineReadFailed = false
+    const cached = await readSnapshot().catch(() => {
+      offlineReadFailed = true
+      return null
+    })
+    if (offlineReadFailed) setOfflineStorageAvailable(false)
     try {
       const res = await fetch(
         '/.netlify/functions/workspace?timezone=' +
@@ -220,6 +258,36 @@ export default function Daystar() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Unable to load workspace')
       const valid = workspaceSchema.parse(data.data)
+      const scopedCache =
+        cached?.scope === data.scope
+          ? cached
+          : await readSnapshot(data.scope).catch(() => null)
+      const plan = syncDecision(scopedCache, data.scope, data.revision)
+      if (plan === 'sync' && scopedCache) {
+        const localDay = dateKey(valid.preferences.timezone)
+        latest.current = valid
+        revision.current = data.revision
+        scope.current = data.scope
+        setW(valid)
+        setMode(data.mode)
+        setToday(localDay)
+        setDate(localDay)
+        setLoaded(true)
+        setOfflinePending(true)
+        await save(scopedCache.data)
+        return
+      } else if (plan === 'conflict' && scopedCache) {
+        setOfflineConflict({
+          local: scopedCache,
+          cloud: valid,
+          revision: data.revision,
+          scope: data.scope,
+        })
+        setOfflinePending(true)
+      } else {
+        setOfflineConflict(null)
+        setOfflinePending(false)
+      }
       latest.current = valid
       setW(valid)
       revision.current = data.revision
@@ -229,10 +297,44 @@ export default function Daystar() {
       setToday(d)
       setDate(d)
       setLoaded(true)
+      if (!scopedCache?.pending)
+        await writeSnapshot({
+          scope: data.scope,
+          revision: data.revision,
+          data: valid,
+          savedAt: new Date().toISOString(),
+          pending: false,
+        })
+          .then(() => setOfflineStorageAvailable(true))
+          .catch(() => setOfflineStorageAvailable(false))
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to load workspace')
+      if (cached) {
+        try {
+          const valid = workspaceSchema.parse(cached.data)
+          latest.current = valid
+          setW(valid)
+          revision.current = cached.revision
+          scope.current = cached.scope
+          setMode('offline')
+          setOfflinePending(cached.pending)
+          setLoaded(true)
+          setError(
+            cached.pending
+              ? 'You are offline. New changes are saved on this device and will sync when you reconnect.'
+              : 'You are offline. Showing the last saved copy from this device.',
+          )
+          return
+        } catch {
+          setError(
+            'The saved offline copy could not be read. Reconnect to load your cloud workspace.',
+          )
+        }
+      } else {
+        setError(e instanceof Error ? e.message : 'Unable to load workspace')
+      }
     }
   }
+  loadRef.current = load
   useEffect(() => {
     async function init() {
       try {
@@ -248,12 +350,31 @@ export default function Daystar() {
       } catch {
         /* Identity configuration is shown in settings. */
       }
-      await load()
+      await loadRef.current()
     }
     void init()
+    if ('serviceWorker' in navigator)
+      void navigator.serviceWorker.register('/sw.js').catch(() => {})
+    const reconnect = () => {
+      if (
+        modalState.current ||
+        learningEditing.current ||
+        busy.current ||
+        latest.current.focus.some(
+          (session) =>
+            session.status === 'running' || session.status === 'paused',
+        )
+      )
+        return
+      void loadRef.current()
+    }
+    window.addEventListener('online', reconnect)
     const timer = setInterval(() => setTick(Date.now()), 1000)
     if ('Notification' in window) setPermission(Notification.permission)
-    return () => clearInterval(timer)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener('online', reconnect)
+    }
   }, [])
   useEffect(() => {
     const d = dateKey(w.preferences.timezone, new Date(tick))
@@ -280,12 +401,65 @@ export default function Daystar() {
           revision: revision.current,
           scope: scope.current,
         }),
+      }).catch(async () => {
+        await writeSnapshot({
+          scope: scope.current,
+          revision: revision.current,
+          data: valid,
+          savedAt: new Date().toISOString(),
+          pending: true,
+        })
+        setOfflineStorageAvailable(true)
+        return null
       })
+      if (!res) {
+        setW(valid)
+        latest.current = valid
+        setOfflinePending(true)
+        setMode('offline')
+        setError(
+          'Offline changes are saved on this device and waiting to sync.',
+        )
+        toast.success('Saved on this device. It will sync when you reconnect.')
+        return true
+      }
       const result = await res.json()
+      if ([502, 503, 504].includes(res.status)) {
+        await writeSnapshot({
+          scope: scope.current,
+          revision: revision.current,
+          data: valid,
+          savedAt: new Date().toISOString(),
+          pending: true,
+        })
+        setOfflineStorageAvailable(true)
+        setW(valid)
+        latest.current = valid
+        setOfflinePending(true)
+        setMode('offline')
+        setError(
+          'The workspace is unavailable. Changes are saved on this device and waiting to sync.',
+        )
+        toast.success(
+          'Saved on this device. It will sync when the workspace is available.',
+        )
+        return true
+      }
       if (!res.ok) throw new Error(result.error || 'Saving failed')
       revision.current = result.revision
       setW(valid)
       latest.current = valid
+      setOfflinePending(false)
+      setOfflineConflict(null)
+      await writeSnapshot({
+        scope: scope.current,
+        revision: result.revision,
+        data: valid,
+        savedAt: new Date().toISOString(),
+        pending: false,
+      })
+        .then(() => setOfflineStorageAvailable(true))
+        .catch(() => setOfflineStorageAvailable(false))
       return true
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Saving failed')
@@ -312,6 +486,10 @@ export default function Daystar() {
         )
       )
         return
+      if (offlinePending) {
+        if (navigator.onLine) void loadRef.current()
+        return
+      }
       try {
         const priorRevision = revision.current
         const priorScope = scope.current
@@ -344,7 +522,7 @@ export default function Daystar() {
       }
     }, 30000)
     return () => clearInterval(interval)
-  }, [loaded, modal])
+  }, [loaded, modal, offlinePending])
   const list = occurrencesFor(w, date),
     stats = metrics(list),
     week = Array.from({ length: 7 }, (_, i) => addDay(date, i - 6))
@@ -451,13 +629,13 @@ export default function Daystar() {
     }).then((saved) => {
       if (!saved) return
       const titles = due
-        .map((r) => w.tasks.find((t) => t.id === r.taskId)?.title)
+        .map((r) => latest.current.tasks.find((t) => t.id === r.taskId)?.title)
         .filter(Boolean)
         .join(' · ')
       toast(`Time for: ${titles}`)
       void deliverNotification(titles, 'daystar-routines').catch(() => {})
     })
-  }, [tick, loaded, w.reminders, today])
+  }, [tick, loaded, w, today])
   function navigate(p: Page) {
     learningEditing.current = false
     setPage(p)
@@ -526,6 +704,9 @@ export default function Daystar() {
           toast.success('Check your email for a recovery link.')
           return
         }
+        const priorMode = mode
+        const priorScope = scope.current
+        const priorWorkspace = latest.current
         const u =
           authMode === 'signup'
             ? await signup(v('email'), v('password'), { full_name: v('name') })
@@ -536,7 +717,37 @@ export default function Daystar() {
         }
         setUser({ email: u.email, name: u.name })
         setModal(null)
-        await load()
+        await loadRef.current()
+        if (
+          priorMode !== 'account' &&
+          priorScope !== scope.current &&
+          savedRecordCount(priorWorkspace) > 0
+        ) {
+          const hasAccountRecords = savedRecordCount(latest.current) > 0
+          const message = hasAccountRecords
+            ? 'This browser has saved DAYSTAR records, and this account already has records too. Add the browser records that have new IDs? Existing account records with matching IDs will be kept. The browser workspace remains available when you sign out.'
+            : 'This browser has saved DAYSTAR records. Add them to your account so they are available on your other devices? Your private browser copy remains available when you sign out.'
+          if (confirm(message)) {
+            const bothHaveActiveFocus =
+              latest.current.focus.some(
+                (session) =>
+                  session.status === 'running' || session.status === 'paused',
+              ) &&
+              priorWorkspace.focus.some(
+                (session) =>
+                  session.status === 'running' || session.status === 'paused',
+              )
+            if (bothHaveActiveFocus) {
+              toast.error(
+                'Finish the active focus session on one workspace, then export and import the other copy.',
+              )
+            } else if (
+              await save(mergeBackup(latest.current, priorWorkspace))
+            ) {
+              toast.success('Your browser records were added to your account.')
+            }
+          }
+        }
         return
       }
       if (modal.type === 'task') {
@@ -743,14 +954,14 @@ export default function Daystar() {
       ),
     })
   }
-  function download() {
+  function downloadWorkspace(data: Workspace, filename: string) {
     const blob = new Blob(
       [
         JSON.stringify(
           {
             format: 'daystar-backup',
             exportedAt: new Date().toISOString(),
-            data: w,
+            data,
           },
           null,
           2,
@@ -761,10 +972,92 @@ export default function Daystar() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `daystar-${today}.json`
+    a.download = filename
     a.click()
     URL.revokeObjectURL(url)
+  }
+  function download() {
+    downloadWorkspace(w, `daystar-${today}.json`)
     toast.success('Backup downloaded. Keep it somewhere private.')
+  }
+  async function keepCloudCopy() {
+    const conflict = offlineConflict
+    if (!conflict) return
+    if (
+      !confirm(
+        'Use the newer cloud copy on this device? Your offline version will stop syncing. Download the offline copy first if you need its changes.',
+      )
+    )
+      return
+    try {
+      await writeSnapshot({
+        scope: conflict.scope,
+        revision: conflict.revision,
+        data: conflict.cloud,
+        savedAt: new Date().toISOString(),
+        pending: false,
+      })
+      setW(conflict.cloud)
+      latest.current = conflict.cloud
+      revision.current = conflict.revision
+      scope.current = conflict.scope
+      setOfflinePending(false)
+      setOfflineConflict(null)
+      setError('')
+      toast.success('This device is using the cloud copy.')
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : 'Could not update the offline copy.',
+      )
+    }
+  }
+  async function keepDeviceCopy() {
+    const conflict = offlineConflict
+    if (!conflict) return
+    if (
+      !confirm(
+        'Replace the newer cloud workspace with this device’s saved version? Download both copies first if you need a recovery path.',
+      )
+    )
+      return
+    setSaving(true)
+    busy.current = true
+    try {
+      const response = await fetch('/.netlify/functions/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data: conflict.local.data,
+          revision: conflict.revision,
+          scope: conflict.scope,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok)
+        throw new Error(result.error || 'Could not sync this device copy.')
+      revision.current = result.revision
+      scope.current = conflict.scope
+      setW(conflict.local.data)
+      latest.current = conflict.local.data
+      setOfflinePending(false)
+      setOfflineConflict(null)
+      setError('')
+      await writeSnapshot({
+        scope: conflict.scope,
+        revision: result.revision,
+        data: conflict.local.data,
+        savedAt: new Date().toISOString(),
+        pending: false,
+      })
+      toast.success('Your device copy is now saved to the cloud.')
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : 'Could not sync this device copy.',
+      )
+    } finally {
+      busy.current = false
+      setSaving(false)
+    }
   }
   async function importFile(f: File) {
     try {
@@ -998,7 +1291,8 @@ export default function Daystar() {
           <button
             className="profile"
             onClick={() => {
-              user ? navigate('Settings') : setModal({ type: 'auth' })
+              if (user) navigate('Settings')
+              else setModal({ type: 'auth' })
             }}
           >
             <span className="avatar">
@@ -1045,10 +1339,18 @@ export default function Daystar() {
               {saving || authPending
                 ? 'Saving…'
                 : loaded
-                  ? user
-                    ? 'Cloud saved'
-                    : 'Private workspace'
-                  : 'Connecting…'}
+                  ? offlineConflict
+                    ? 'Sync conflict'
+                    : offlinePending
+                      ? 'Saved on device'
+                      : mode === 'offline'
+                        ? 'Offline copy'
+                        : user
+                          ? 'Cloud saved'
+                          : 'Private workspace'
+                  : error
+                    ? 'Connection failed'
+                    : 'Connecting…'}
             </span>
             <button
               className="icon-btn notification-btn"
@@ -1084,6 +1386,61 @@ export default function Daystar() {
                 Retry connection
               </button>
             </div>
+          )}
+          {offlineConflict && (
+            <section
+              className="sync-conflict"
+              role="alert"
+              aria-labelledby="sync-conflict-title"
+            >
+              <div>
+                <strong id="sync-conflict-title">
+                  This device and your cloud workspace both changed.
+                </strong>
+                <p>
+                  Your offline copy is safe on this device. Download either
+                  version before choosing which one to continue with.
+                </p>
+              </div>
+              <div className="sync-conflict-actions">
+                <button
+                  className="button secondary"
+                  onClick={() =>
+                    downloadWorkspace(
+                      offlineConflict.local.data,
+                      `daystar-device-copy-${today}.json`,
+                    )
+                  }
+                >
+                  Download device copy
+                </button>
+                <button
+                  className="button secondary"
+                  onClick={() =>
+                    downloadWorkspace(
+                      offlineConflict.cloud,
+                      `daystar-cloud-copy-${today}.json`,
+                    )
+                  }
+                >
+                  Download cloud copy
+                </button>
+                <button
+                  className="button secondary"
+                  disabled={saving}
+                  onClick={() => void keepCloudCopy()}
+                >
+                  Use cloud copy
+                </button>
+                <button
+                  className="button primary"
+                  disabled={saving}
+                  onClick={() => void keepDeviceCopy()}
+                >
+                  Use device copy for cloud
+                </button>
+              </div>
+            </section>
           )}
           <div className="page-heading">
             <div>
@@ -2601,8 +2958,9 @@ export default function Daystar() {
                     <p className="helper">
                       Records are saved in Netlify Database under a private,
                       secure browser cookie. Sign in for an account workspace
-                      that syncs across devices. Before signing in, export this
-                      workspace to import it into your account.
+                      that syncs across devices. After signing in, you can
+                      explicitly add this browser’s records to your account;
+                      export first if you also want a separate backup file.
                     </p>
                     <button
                       className="button primary"
@@ -2842,17 +3200,39 @@ export default function Daystar() {
                   <div className="service-row">
                     <span>Storage</span>
                     <b>
-                      {loaded
-                        ? 'Netlify Database connected'
-                        : 'Connection pending'}
+                      {mode === 'offline'
+                        ? 'Offline device copy'
+                        : loaded
+                          ? 'Netlify Database connected'
+                          : error
+                            ? 'Unavailable · retry connection'
+                            : 'Connection pending'}
                     </b>
                   </div>
                   <div className="service-row">
                     <span>Cross-device sync</span>
                     <b>
-                      {mode === 'account'
-                        ? 'Account workspace'
-                        : 'Sign in to connect'}
+                      {offlineConflict
+                        ? 'Needs your choice'
+                        : offlinePending
+                          ? 'Waiting for connection'
+                          : mode === 'account'
+                            ? 'Account workspace'
+                            : 'Sign in to connect'}
+                    </b>
+                  </div>
+                  <div className="service-row">
+                    <span>Offline copy</span>
+                    <b>
+                      {offlineStorageAvailable === false
+                        ? 'Unavailable in this browser'
+                        : offlinePending
+                          ? 'Changes waiting to sync'
+                          : mode === 'offline'
+                            ? 'Last saved copy in this browser'
+                            : offlineStorageAvailable
+                              ? 'Ready on this browser'
+                              : 'Checking availability'}
                     </b>
                   </div>
                   <div className="service-row">
@@ -2865,10 +3245,13 @@ export default function Daystar() {
                   </div>
                   <p className="helper">
                     Private records are accessed on the server. Journal entries
-                    are never included in AI requests. Failed writes stay
-                    visible as errors; there is no silent offline save. Do not
-                    close an unsaved form. Browser workspaces depend on their
-                    private cookie; export before clearing browser data.
+                    are never included in AI requests. A private offline copy is
+                    stored in this browser’s IndexedDB and may be accessible to
+                    anyone using this browser profile. Offline edits sync after
+                    reconnection when the cloud revision is unchanged. A
+                    conflict stops automatic sync and keeps both copies until
+                    you choose. Browser workspaces also depend on their private
+                    cookie; export before clearing browser data.
                   </p>
                 </section>
                 <div className="version-note">

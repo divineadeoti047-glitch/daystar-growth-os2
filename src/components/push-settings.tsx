@@ -21,6 +21,8 @@ export function PushSettings({
   )
   useEffect(() => {
     let active = true
+    // This reset is scoped to the authenticated workspace; do not show one account's push state for another.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEnabled(false)
     setConfig(null)
     void (async () => {
@@ -36,9 +38,7 @@ export function PushSettings({
             : 'Background push needs deployed service configuration. Open-page reminders remain available.',
         )
         if ('serviceWorker' in navigator && 'PushManager' in window) {
-          const worker = await navigator.serviceWorker.getRegistration(
-            '/notifications-sw.js',
-          )
+          const worker = await navigator.serviceWorker.getRegistration('/sw.js')
           const subscription = await worker?.pushManager.getSubscription()
           if (subscription) {
             const digest = await crypto.subtle.digest(
@@ -111,9 +111,7 @@ export function PushSettings({
   async function disconnect() {
     setWorking(true)
     try {
-      const worker = await navigator.serviceWorker.getRegistration(
-        '/notifications-sw.js',
-      )
+      const worker = await navigator.serviceWorker.getRegistration('/sw.js')
       const subscription = await worker?.pushManager.getSubscription()
       if (subscription) {
         const res = await fetch('/.netlify/functions/push-device', {

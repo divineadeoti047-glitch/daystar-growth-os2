@@ -4,8 +4,7 @@ export async function enableNotifications() {
   if (!('Notification' in window) || !('serviceWorker' in navigator))
     throw new Error('Notifications unavailable')
   const permission = await Notification.requestPermission()
-  if (permission === 'granted')
-    await navigator.serviceWorker.register('/notifications-sw.js')
+  if (permission === 'granted') await navigator.serviceWorker.register('/sw.js')
   return permission
 }
 export async function deliverNotification(
@@ -15,9 +14,7 @@ export async function deliverNotification(
   if (!('Notification' in window) || Notification.permission !== 'granted')
     return
   if (!('serviceWorker' in navigator)) return
-  const registration = await navigator.serviceWorker.register(
-    '/notifications-sw.js',
-  )
+  const registration = await navigator.serviceWorker.register('/sw.js')
   if (!registration.active) await navigator.serviceWorker.ready
   await registration.showNotification('DAYSTAR · A moment for your growth', {
     body,
