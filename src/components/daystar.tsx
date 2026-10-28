@@ -41,15 +41,12 @@ import {
 } from 'lucide-react'
 import {
   getUser,
-  getSettings,
-  handleAuthCallback,
   login,
   signup,
   logout,
-  oauthLogin,
   requestPasswordRecovery,
   updateUser,
-} from '@netlify/identity'
+} from '@/lib/auth-client'
 import {
   Dialog,
   DialogContent,
@@ -212,7 +209,6 @@ export default function Daystar() {
     [error, setError] = useState(''),
     [mode, setMode] = useState('device'),
     [user, setUser] = useState<{ email?: string; name?: string } | null>(null),
-    [google, setGoogle] = useState(false),
     [search, setSearch] = useState(''),
     [area, setArea] = useState('all'),
     [range, setRange] = useState(7),
@@ -252,7 +248,7 @@ export default function Daystar() {
     if (offlineReadFailed) setOfflineStorageAvailable(false)
     try {
       const res = await fetch(
-        '/.netlify/functions/workspace?timezone=' +
+        '/api/workspace?timezone=' +
           encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone),
       )
       const data = await res.json()
@@ -338,17 +334,10 @@ export default function Daystar() {
   useEffect(() => {
     async function init() {
       try {
-        const callback = await handleAuthCallback()
-        if (callback?.type === 'recovery') {
-          setAuthMode('newpassword')
-          setModal({ type: 'auth' })
-        }
         const u = await getUser()
         setUser(u ? { email: u.email, name: u.name } : null)
-        const settings = await getSettings()
-        setGoogle(!!settings.providers.google)
       } catch {
-        /* Identity configuration is shown in settings. */
+        /* The current account session may be unavailable while offline. */
       }
       await loadRef.current()
     }
@@ -393,7 +382,7 @@ export default function Daystar() {
     setError('')
     try {
       const valid = workspaceSchema.parse(next)
-      const res = await fetch('/.netlify/functions/workspace', {
+      const res = await fetch('/api/workspace', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -494,7 +483,7 @@ export default function Daystar() {
         const priorRevision = revision.current
         const priorScope = scope.current
         const res = await fetch(
-          '/.netlify/functions/workspace?timezone=' +
+          '/api/workspace?timezone=' +
             encodeURIComponent(
               Intl.DateTimeFormat().resolvedOptions().timeZone,
             ),
@@ -872,7 +861,7 @@ export default function Daystar() {
     setChat((c) => [...c, { role: 'you', text: message }])
     setThinking(true)
     try {
-      const res = await fetch('/.netlify/functions/coach', {
+      const res = await fetch('/api/coach', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message, scope: scope.current }),
@@ -1023,7 +1012,7 @@ export default function Daystar() {
     setSaving(true)
     busy.current = true
     try {
-      const response = await fetch('/.netlify/functions/workspace', {
+      const response = await fetch('/api/workspace', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2956,7 +2945,7 @@ export default function Daystar() {
                 ) : (
                   <>
                     <p className="helper">
-                      Records are saved in Netlify Database under a private,
+                      Records are saved in the private cloud workspace under a
                       secure browser cookie. Sign in for an account workspace
                       that syncs across devices. After signing in, you can
                       explicitly add this browser’s records to your account;
@@ -3203,7 +3192,7 @@ export default function Daystar() {
                       {mode === 'offline'
                         ? 'Offline device copy'
                         : loaded
-                          ? 'Netlify Database connected'
+                          ? 'Cloud database connected'
                           : error
                             ? 'Unavailable · retry connection'
                             : 'Connection pending'}
@@ -3236,12 +3225,12 @@ export default function Daystar() {
                     </b>
                   </div>
                   <div className="service-row">
-                    <span>Google sign-in</span>
-                    <b>{google ? 'Available' : 'Provider setup required'}</b>
+                    <span>Sign-in</span>
+                    <b>Email and password</b>
                   </div>
                   <div className="service-row">
                     <span>AI coach</span>
-                    <b>Gateway · checked on request</b>
+                    <b>Server-side provider</b>
                   </div>
                   <p className="helper">
                     Private records are accessed on the server. Journal entries
@@ -3259,7 +3248,7 @@ export default function Daystar() {
                   DAYSTAR Personal Growth OS
                   <span>Version 2.0 · A fresh beginning</span>
                   <a
-                    href="https://app.netlify.com/projects/daystar-growth-os"
+                    href="https://vercel.com/dashboard"
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -3703,16 +3692,6 @@ export default function Daystar() {
             )}
             {modal?.type === 'auth' && (
               <>
-                {google && authMode !== 'newpassword' && (
-                  <button
-                    className="button secondary wide-button"
-                    type="button"
-                    onClick={() => oauthLogin('google')}
-                  >
-                    Continue with Google
-                    <ArrowUpRight size={16} />
-                  </button>
-                )}
                 {authMode === 'signup' && (
                   <Field label="Your name">
                     <input

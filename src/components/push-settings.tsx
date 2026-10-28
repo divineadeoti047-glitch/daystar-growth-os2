@@ -27,7 +27,7 @@ export function PushSettings({
     setConfig(null)
     void (async () => {
       try {
-        const res = await fetch('/.netlify/functions/push-device')
+        const res = await fetch('/api/push-device')
         if (!res.ok) throw new Error()
         const data = await res.json()
         if (!active) return
@@ -87,7 +87,7 @@ export function PushSettings({
           userVisibleOnly: true,
           applicationServerKey: key,
         }))
-      const res = await fetch('/.netlify/functions/push-device', {
+      const res = await fetch('/api/push-device', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope, subscription: subscription.toJSON() }),
@@ -114,7 +114,7 @@ export function PushSettings({
       const worker = await navigator.serviceWorker.getRegistration('/sw.js')
       const subscription = await worker?.pushManager.getSubscription()
       if (subscription) {
-        const res = await fetch('/.netlify/functions/push-device', {
+        const res = await fetch('/api/push-device', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ scope, subscription: subscription.toJSON() }),

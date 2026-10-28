@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.output/
+.nitro/
+.vercel/
+.env
+.env.*
+!.env.example
+pnpm-workspace.yaml
+coverage/

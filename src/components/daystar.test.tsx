@@ -9,10 +9,8 @@ import {
 import Daystar from './daystar'
 import { initialWorkspace } from '@/lib/model'
 
-vi.mock('@netlify/identity', () => ({
+vi.mock('@/lib/auth-client', () => ({
   getUser: vi.fn().mockResolvedValue(null),
-  getSettings: vi.fn().mockResolvedValue({ providers: {} }),
-  handleAuthCallback: vi.fn().mockResolvedValue(null),
   login: vi.fn().mockResolvedValue({
     email: 'reader@example.com',
     name: 'Reader',

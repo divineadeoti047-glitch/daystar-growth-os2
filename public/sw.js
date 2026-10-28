@@ -1,4 +1,4 @@
-const CACHE = 'daystar-shell-v1'
+const CACHE = 'daystar-shell-v2'
 const SHELL = ['/', '/daystar.svg', '/manifest.webmanifest']
 
 self.addEventListener('install', (event) => {
@@ -31,7 +31,8 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url)
   if (
     url.origin !== self.location.origin ||
-    url.pathname.startsWith('/.netlify/')
+    url.pathname.startsWith('/.netlify/') ||
+    url.pathname.startsWith('/api/')
   )
     return
 
